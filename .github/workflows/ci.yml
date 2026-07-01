@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  detect-perf-benchmark:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.detect.outputs.should_run }}
+    steps:
+      - name: Detect perf benchmark inputs
+        id: detect
+        run: echo 0
