@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
@@ -19,4 +22,87 @@ jobs:
     steps:
       - name: Detect perf benchmark inputs
         id: detect
-        run: echo 0
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const isPullRequest = context.eventName === 'pull_request';
+            const shouldCheckPerfDirectory = isPullRequest;
+            const patterns = [
+              /^src\/data\//,
+              /(^|\/)sql\.ts$/,
+              /^db\/migrations\//,
+            ];
+            if (shouldCheckPerfDirectory) patterns.push(/^perf\//);
+
+            let files = [];
+            if (isPullRequest) {
+              const pull_number = context.payload.pull_request.number;
+              const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number,
+                per_page: 100,
+              });
+              files = changedFiles.map((file) => file.filename);
+            } else {
+              const before = context.payload.before;
+              const after = context.payload.after;
+              if (before && !/^0+$/.test(before)) {
+                const comparison = await github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${before}...${after}`,
+                });
+                files = (comparison.data.files || []).map((file) => file.filename);
+              } else {
+                for (const commit of context.payload.commits || []) {
+                  files.push(...(commit.added || []), ...(commit.modified || []), ...(commit.removed || []));
+                }
+              }
+            }
+
+            const changed = files.some((file) => patterns.some((pattern) => pattern.test(file)));
+            const hasPerfLabel = !isPullRequest || context.payload.pull_request.labels.some((label) => label.name === 'perf');
+            core.setOutput('should_run', changed && hasPerfLabel ? 'true' : 'false');
+
+  backend-checks:
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && github.base_ref == 'main' && github.event.action != 'labeled')
+    uses: ./.github/workflows/backend-checks.yml
+    permissions:
+      contents: read
+    with:
+      notify_on_failure: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit
+
+  main-branch-dev-deploy:
+    needs: [backend-checks]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.backend-checks.result == 'success'
+    uses: ./.github/workflows/deploy-to-dev.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets: inherit
+
+  perf-benchmark:
+    needs: [detect-perf-benchmark]
+    # Disabled until the perf benchmark workflow is ready to run again.
+    if: ${{ false }}
+    uses: ./.github/workflows/perf-benchmark.yml
+    permissions:
+      contents: write
+      pull-requests: write
+    with:
+      vus: "10"
+      duration: "180s"
+      comment_on_pr: ${{ github.event_name == 'pull_request' }}
+      update_baseline: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    secrets: inherit
+
+  labeler:
+    if: github.event_name == 'pull_request_target'
+    uses: ./.github/workflows/labeler.yml
+    permissions:
+      contents: read
+      pull-requests: write

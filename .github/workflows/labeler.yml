@@ -1,0 +1,21 @@
+name: PR Labeler
+
+# Applies labels from .github/labeler.yml based on a PR's changed files.
+# Note: labels added here use the default GITHUB_TOKEN, which (by GitHub's no-recursion rule)
+# does NOT itself fire the perf-benchmark `labeled` trigger — the benchmark instead runs on the
+# PR's next `synchronize` (push) with the label present. To run it the instant a PR opens, add
+# the `perf` label by hand (a human/PAT-added label does fire the trigger).
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          sync-labels: false   # don't strip manually-added labels

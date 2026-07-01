@@ -1,0 +1,164 @@
+name: Deploy stormy-backend to dev
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ECR_REGISTRY: 631946745248.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REGISTRY_ID: "631946745248"
+  ECR_REPO: stormy-backend
+  AWS_REGION: eu-central-1
+  DEPLOYMENT_REPO: Stormy-AS/stormy_deployment_argocd
+  DEV_OVERLAY_PATH: stormy-app/.argocd-source-stormy-backend-dev-eu-central-1.yaml
+
+jobs:
+  deploy-to-dev:
+    runs-on: self-hosted
+    concurrency:
+      group: stormy-backend-deploy
+      cancel-in-progress: false
+    env:
+      GH_VERSION: "2.65.0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Ensure gh CLI is available
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if "$HOME/.local/bin/gh" --version 2>/dev/null | grep -q "${GH_VERSION}"; then
+            echo "gh ${GH_VERSION} already installed."
+          else
+            echo "Installing gh ${GH_VERSION}..."
+            rm -rf /tmp/gh-install && mkdir -p /tmp/gh-install
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+              | tar -xz -C /tmp/gh-install --strip-components=1
+            mv /tmp/gh-install/bin/gh "$HOME/.local/bin/gh"
+            rm -rf /tmp/gh-install
+          fi
+          "$HOME/.local/bin/gh" --version
+
+      - name: Compute image tags (pseudo-semver anchored to latest release)
+        id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+
+          # Anchor the pseudo-semver to the most recent non-pre-release on this
+          # repo, e.g. "v1.2.3". Fall back to v0.0.0 when no release exists yet.
+          LATEST=$(gh release list \
+            --repo "${{ github.repository }}" \
+            --limit 1 \
+            --exclude-drafts \
+            --exclude-pre-releases \
+            --json tagName --jq '.[0].tagName // ""')
+          BASE="${LATEST#v}"
+          BASE="${BASE:-0.0.0}"
+
+          # Format: v<base>-dev.<run_number>-<short_sha>.
+          # '+' (semver build-metadata separator) is rejected by Docker tags;
+          # the inner '-' keeps the value semver-shaped and ECR-safe.
+          PSEUDO="v${BASE}-dev.${{ github.run_number }}-${SHORT_SHA}"
+
+          echo "Pseudo-semver: ${PSEUDO}"
+          {
+            echo "short_sha=${SHORT_SHA}"
+            echo "pseudo=${PSEUDO}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Configure ECR credential helper
+        run: |
+          mkdir -p ~/.docker
+          echo '{"credsStore":"ecr-login"}' > ~/.docker/config.json
+
+      - name: Build and push Docker image (four tags, one digest)
+        env:
+          PSEUDO: ${{ steps.tags.outputs.pseudo }}
+          SHORT_SHA: ${{ steps.tags.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          FULL_IMAGE=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
+          BUILT_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+          docker build \
+            --build-arg GIT_SHA="${SHORT_SHA}" \
+            --build-arg BUILD_NUMBER="${{ github.run_number }}" \
+            --build-arg BUILT_AT="${BUILT_AT}" \
+            -t ${FULL_IMAGE}:sha-${{ github.sha }} \
+            -t ${FULL_IMAGE}:commit-${SHORT_SHA} \
+            -t ${FULL_IMAGE}:${PSEUDO} \
+            -t ${FULL_IMAGE}:latest \
+            .
+          docker push ${FULL_IMAGE}:sha-${{ github.sha }}
+          docker push ${FULL_IMAGE}:commit-${SHORT_SHA}
+          docker push ${FULL_IMAGE}:${PSEUDO}
+          docker push ${FULL_IMAGE}:latest
+
+          echo "Pushed ${FULL_IMAGE} with tags: sha-${{ github.sha }}, commit-${SHORT_SHA}, ${PSEUDO}, latest"
+
+      - name: Mint GitHub App token (scoped to deployment repo)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: Stormy-AS
+          repositories: stormy_deployment_argocd
+
+      - name: Write dev overlay to deployment repo
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PSEUDO: ${{ steps.tags.outputs.pseudo }}
+        run: |
+          set -euo pipefail
+          rm -rf deployment-repo
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ env.DEPLOYMENT_REPO }}.git" deployment-repo
+          cd deployment-repo
+
+          cat > ${{ env.DEV_OVERLAY_PATH }} <<EOF
+          helm:
+            parameters:
+            - name: image.repository
+              value: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}
+              forcestring: true
+            - name: image.tag
+              value: ${PSEUDO}
+              forcestring: true
+          EOF
+
+          git config user.name "stormy-backend-ci"
+          git config user.email "stormy-backend-ci@stormyapp.io"
+          git add ${{ env.DEV_OVERLAY_PATH }}
+
+          if git diff --staged --quiet; then
+            echo "No overlay changes for ${PSEUDO} (re-run on same image); skipping commit."
+          else
+            git commit -m "build: dev image bump for stormy-backend (${PSEUDO})"
+            git push
+          fi
+
+  notify-failure:
+    if: ${{ failure() }}
+    needs: [deploy-to-dev]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Notify Slack on deploy failure
+        uses: ./.github/actions/notify-slack-failure
+        with:
+          slack-webhook-url: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          workflow: ${{ github.workflow }}
+          repository: ${{ github.repository }}
+          sha: ${{ github.sha }}
+          ref-name: ${{ github.ref_name }}
+          actor: ${{ github.actor }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

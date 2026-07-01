@@ -1,0 +1,10 @@
+# Auto-applies the `perf` label to PRs that touch query/schema/benchmark code, so the perf
+# benchmark (which is gated on the `perf` label) runs without anyone remembering to tag the PR.
+# You can still add/remove `perf` by hand to run it on any other PR.
+perf:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/data/**"
+          - "**/sql.ts"
+          - "db/migrations/**"
+          - "perf/**"

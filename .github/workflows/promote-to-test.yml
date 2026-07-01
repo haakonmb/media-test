@@ -1,0 +1,386 @@
+name: Promote stormy-backend to test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Full/short git SHA OR pseudo-semver tag (v0.0.0-dev.<n>-<short>) to promote. Default: whatever is currently deployed on dev.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: stormy-backend-promote-test
+  cancel-in-progress: false
+
+env:
+  ECR_REGISTRY: 631946745248.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REGISTRY_ID: "631946745248"
+  ECR_REPO: stormy-backend
+  AWS_REGION: eu-central-1
+  DEPLOYMENT_REPO: Stormy-AS/stormy_deployment_argocd
+  DEPLOYMENT_BRANCH: master
+  SOURCE_REPO: Stormy-AS/stormy_backend
+  DEV_OVERLAY_PATH: stormy-app/.argocd-source-stormy-backend-dev-eu-central-1.yaml
+  TEST_REGIONS: "eu-central-1 us-east-1 ap-southeast-1"
+  PROMOTE_LABEL: promote-test-stormy-backend
+
+jobs:
+  promote:
+    runs-on: self-hosted
+    outputs:
+      short_sha: ${{ steps.resolve.outputs.short_sha }}
+    env:
+      GH_VERSION: "2.65.0"
+    steps:
+      - name: Ensure gh CLI is available
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if "$HOME/.local/bin/gh" --version 2>/dev/null | grep -q "${GH_VERSION}"; then
+            echo "gh ${GH_VERSION} already installed."
+          else
+            echo "Installing gh ${GH_VERSION}..."
+            rm -rf /tmp/gh-install && mkdir -p /tmp/gh-install
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+              | tar -xz -C /tmp/gh-install --strip-components=1
+            mv /tmp/gh-install/bin/gh "$HOME/.local/bin/gh"
+            rm -rf /tmp/gh-install
+          fi
+          "$HOME/.local/bin/gh" --version
+
+      - name: Mint GH App token (scoped to deployment repo)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          repositories: stormy_deployment_argocd
+
+      - name: Checkout deployment repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.DEPLOYMENT_REPO }}
+          ref: ${{ env.DEPLOYMENT_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: _deploy
+
+      - name: Resolve target image (tag + SHA)
+        id: resolve
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # --registry-id is required because the runner's IAM identity is in
+          # a different AWS account than ECR (cross-account: runner role in dev,
+          # ECR in shared). Without it, the AWS CLI queries the runner's account,
+          # which does not host this repository.
+
+          PSEUDO_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?-dev\.[0-9]+-[0-9a-f]+$'
+
+          if [ -z "${INPUT_REF}" ]; then
+            echo "No ref provided; reading dev overlay from cloned deployment repo."
+            TAG=$(grep -A1 'name: image\.tag' "_deploy/${DEV_OVERLAY_PATH}" \
+              | tail -1 \
+              | sed -E 's/^[[:space:]]*value:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')
+            if [[ ! "${TAG}" =~ ${PSEUDO_RE} ]]; then
+              echo "ERROR: dev overlay image.tag must be a pseudo-semver tag (v<base>-dev.<n>-<short>), got: ${TAG}"
+              exit 1
+            fi
+            SHORT_SHA_FROM_TAG="${TAG##*-}"
+            FULL_SHA=$(gh api "repos/${SOURCE_REPO}/commits/${SHORT_SHA_FROM_TAG}" --jq .sha)
+          elif [[ "${INPUT_REF}" =~ ${PSEUDO_RE} ]]; then
+            echo "Resolving user-provided pseudo-semver tag: ${INPUT_REF}"
+            TAG="${INPUT_REF}"
+
+            # Verify the tag exists in ECR.
+            aws ecr describe-images \
+              --registry-id "${ECR_REGISTRY_ID}" \
+              --repository-name "${ECR_REPO}" \
+              --region "${AWS_REGION}" \
+              --image-ids "imageTag=${TAG}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text > /dev/null
+
+            SHORT_SHA_FROM_TAG="${TAG##*-}"
+            FULL_SHA=$(gh api "repos/${SOURCE_REPO}/commits/${SHORT_SHA_FROM_TAG}" --jq .sha)
+          else
+            echo "Resolving user-provided SHA: ${INPUT_REF}"
+            FULL_SHA=$(gh api "repos/${SOURCE_REPO}/commits/${INPUT_REF}" --jq .sha)
+
+            # Find the pseudo-semver tag attached to this image. dev-deploy
+            # pushes it alongside the sha-<full> tag.
+            DIGEST=$(aws ecr describe-images \
+              --registry-id "${ECR_REGISTRY_ID}" \
+              --repository-name "${ECR_REPO}" \
+              --region "${AWS_REGION}" \
+              --image-ids "imageTag=sha-${FULL_SHA}" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text)
+            if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "ERROR: ECR has no image at sha-${FULL_SHA}; describe-images returned: ${DIGEST}"
+              exit 1
+            fi
+            TAG=$(aws ecr describe-images \
+              --registry-id "${ECR_REGISTRY_ID}" \
+              --repository-name "${ECR_REPO}" \
+              --region "${AWS_REGION}" \
+              --image-ids "imageDigest=${DIGEST}" \
+              --query 'imageDetails[0].imageTags' \
+              --output json \
+              | jq -r '.[] | select(test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?-dev\\.[0-9]+-[0-9a-f]+$"))' \
+              | head -1)
+            if [ -z "${TAG}" ]; then
+              echo "ERROR: no pseudo-semver tag found for digest ${DIGEST}."
+              echo "Was this image built before the STORMY-612 pseudo-semver rollout?"
+              exit 1
+            fi
+          fi
+
+          SHORT_SHA="${FULL_SHA:0:7}"
+          echo "Tag:       ${TAG}"
+          echo "Full SHA:  ${FULL_SHA}"
+          echo "Short SHA: ${SHORT_SHA}"
+          {
+            echo "tag=${TAG}"
+            echo "full_sha=${FULL_SHA}"
+            echo "short_sha=${SHORT_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Pre-flight (label, close prior PRs, clean dangling branches)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
+          RUN_ID: ${{ github.run_id }}
+        working-directory: _deploy
+        run: |
+          set -euo pipefail
+
+          # Self-heal label (idempotent via --force).
+          gh label create "${PROMOTE_LABEL}" \
+            --repo "${DEPLOYMENT_REPO}" \
+            --color BFE5BF \
+            --description "Auto-managed: PR promotes stormy-backend to test" \
+            --force
+
+          # Close any open prior promote PRs (their branches are deleted via --delete-branch).
+          for pr in $(gh pr list \
+            --repo "${DEPLOYMENT_REPO}" \
+            --state open \
+            --label "${PROMOTE_LABEL}" \
+            --json number --jq '.[].number'); do
+            echo "Closing prior promote PR #${pr}"
+            gh pr close "${pr}" \
+              --repo "${DEPLOYMENT_REPO}" \
+              --delete-branch \
+              --comment "Superseded by promote of sha-${SHORT_SHA} (workflow run ${RUN_ID})."
+          done
+
+          # Refresh remote heads after the deletions above.
+          git fetch origin --prune
+
+          # Anything matching the pattern now is PR-less. Delete.
+          active_heads=$(gh pr list \
+            --repo "${DEPLOYMENT_REPO}" \
+            --state open \
+            --label "${PROMOTE_LABEL}" \
+            --json headRefName --jq '.[].headRefName')
+          for ref in $(git ls-remote --heads origin "promote-test-stormy-backend-*" \
+            | awk '{print $2}' | sed 's|refs/heads/||'); do
+            if ! grep -qx "${ref}" <<< "${active_heads}"; then
+              echo "Deleting dangling branch: ${ref}"
+              git push origin --delete "${ref}" || true
+            fi
+          done
+
+      - name: Promote (rewrite overlays, push, open PR)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          FULL_SHA: ${{ steps.resolve.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.resolve.outputs.short_sha }}
+          RUN_ID: ${{ github.run_id }}
+        working-directory: _deploy
+        run: |
+          set -euo pipefail
+
+          BRANCH="promote-test-stormy-backend-${SHORT_SHA}-${RUN_ID}"
+          git checkout -b "${BRANCH}"
+
+          TEMPLATE=$(cat <<EOF
+          helm:
+            parameters:
+            - name: image.repository
+              value: ${ECR_REGISTRY}/${ECR_REPO}
+              forcestring: true
+            - name: image.tag
+              value: ${TAG}
+              forcestring: true
+          EOF
+          )
+
+          for region in ${TEST_REGIONS}; do
+            echo "${TEMPLATE}" > "stormy-app/.argocd-source-stormy-backend-test-${region}.yaml"
+          done
+
+          git config user.name "stormy-backend-ci"
+          git config user.email "stormy-backend-ci@stormyapp.io"
+          git add stormy-app/.argocd-source-stormy-backend-test-*.yaml
+
+          if git diff --staged --quiet; then
+            echo "All test overlays already pinned to ${TAG}; nothing to promote."
+            exit 0
+          fi
+
+          git commit -m "promote: stormy-backend to test (${TAG})"
+          git push -u origin "${BRANCH}"
+
+          # PR body inputs (best-effort; missing values render as "(not found)").
+          COMMIT_SUBJECT=$(GH_TOKEN="${SOURCE_TOKEN}" gh api \
+            "repos/${SOURCE_REPO}/commits/${FULL_SHA}" \
+            --jq '.commit.message' | head -1)
+          DEV_DEPLOY_RUN_URL=$(GH_TOKEN="${SOURCE_TOKEN}" gh run list \
+            --repo "${SOURCE_REPO}" \
+            --workflow deploy-to-dev.yml \
+            --commit "${FULL_SHA}" \
+            --limit 1 \
+            --json url --jq '.[0].url // ""')
+          PROMOTE_RUN_URL="https://github.com/${SOURCE_REPO}/actions/runs/${RUN_ID}"
+
+          cat > /tmp/pr-body.md <<PRBODY
+          ## Promote stormy-backend to test: \`${TAG}\`
+
+          | | |
+          |---|---|
+          | Image tag     | \`${TAG}\` |
+          | Source commit | [\`${SHORT_SHA}\`](https://github.com/${SOURCE_REPO}/commit/${FULL_SHA}) — ${COMMIT_SUBJECT} |
+          | Dev deploy run | ${DEV_DEPLOY_RUN_URL:-(not found)} |
+          | Promote run   | ${PROMOTE_RUN_URL} |
+
+          ## Diff
+
+          Same change in all three test region overlay files (\`stormy-app/.argocd-source-stormy-backend-test-{eu-central-1,us-east-1,ap-southeast-1}.yaml\`):
+
+          \`\`\`diff
+           helm:
+             parameters:
+             - name: image.tag
+          -    value: "<old>"
+          +    value: "${TAG}"
+               forcestring: true
+          \`\`\`
+
+          ## Behavior on merge
+
+          All three test hubs reconcile within a few minutes. Each test spoke rolls stormy-backend to the new image tag. Atomic across all three regions.
+          PRBODY
+
+          gh pr create \
+            --repo "${DEPLOYMENT_REPO}" \
+            --base "${DEPLOYMENT_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Promote stormy-backend to test: sha-${SHORT_SHA}" \
+            --label "${PROMOTE_LABEL}" \
+            --body-file /tmp/pr-body.md
+
+          # Auto-merge. The workflow_dispatch click is the deliberate "promote
+          # now" gate and test promotion is reversible, so an additional manual
+          # PR merge adds no review surface. Release-to-prod keeps the manual
+          # merge as its release-confirmation gate.
+          gh pr merge "${BRANCH}" \
+            --repo "${DEPLOYMENT_REPO}" \
+            --squash \
+            --delete-branch
+
+  # Poll /version on test.stormy-api.com after the promote PR is merged
+  # and ArgoCD reconciles. Requires N consecutive responses where gitSha
+  # matches the promoted SHORT_SHA — Route53 sprays across the three
+  # regional ALBs, so N-of-N convergence is probabilistic evidence that
+  # all three regions rolled. Closes the 9-hour blind spot from the
+  # 2026-05-29 outage.
+  #
+  # Rapid-promote ordering: a second promote of a new SHA queues behind
+  # this run via the workflow's `concurrency` group (see top of file).
+  # No "got overtaken by the next promote" race — promotes serialise.
+  #
+  # First-run caveat: the first promote after THIS PR merges will
+  # deadline-out, because the SHA being verified isn't the one already
+  # rolling (that promote ran before smoke existed). Expected; every
+  # subsequent promote self-verifies. See PR #305 description for the
+  # full rationale.
+  post-promote-smoke:
+    needs: [promote]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post-promote smoke (poll /version until N-of-N convergence)
+        env:
+          SHORT_SHA: ${{ needs.promote.outputs.short_sha }}
+          SMOKE_URL: https://test.stormy-api.com/version
+          REQUIRED_CONSECUTIVE: "10"
+          DEADLINE_SECONDS: "1000"
+          POLL_INTERVAL_SECONDS: "5"
+        run: |
+          set -euo pipefail
+          deadline=$(( $(date +%s) + DEADLINE_SECONDS ))
+          consecutive=0
+          last_seen=""
+          http_code="000"
+          while [ $(date +%s) -lt $deadline ]; do
+            # Capture HTTP status alongside the body so the miss-log can
+            # distinguish "endpoint down" from "endpoint up, body weird".
+            # `|| http_code=000` sits outside the $(...) so curl's own -w "000"
+            # output on DNS/timeout failures isn't doubled.
+            http_code=$(curl -sS -o /tmp/version.json -w '%{http_code}' --max-time 5 "${SMOKE_URL}" 2>/dev/null) || http_code="000"
+            if [ "${http_code}" = "200" ]; then
+              seen=$(jq -r '.gitSha // ""' </tmp/version.json 2>/dev/null || echo "")
+            else
+              seen=""
+            fi
+            if [ "${seen}" = "${SHORT_SHA}" ]; then
+              consecutive=$(( consecutive + 1 ))
+              echo "ok ${consecutive}/${REQUIRED_CONSECUTIVE} (seen=${seen})"
+              if [ "${consecutive}" -ge "${REQUIRED_CONSECUTIVE}" ]; then
+                echo "All regions converged on ${SHORT_SHA}."
+                exit 0
+              fi
+            else
+              if [ "${seen}" != "${last_seen}" ]; then
+                if [ -z "${seen}" ]; then
+                  echo "miss: empty seen (http_code=${http_code}) — resetting counter"
+                else
+                  echo "miss: wanted=${SHORT_SHA} got='${seen}' (http_code=${http_code}) — resetting counter"
+                fi
+              fi
+              consecutive=0
+              last_seen="${seen}"
+            fi
+            sleep "${POLL_INTERVAL_SECONDS}"
+          done
+          echo "::error::Smoke deadline exceeded after ${DEADLINE_SECONDS}s. /version is not reporting ${SHORT_SHA} consistently."
+          echo "::error::Last seen: '${last_seen}' (last http_code=${http_code}). Suspect partial rollout, pod crashloop, or /version not yet deployed."
+          exit 1
+
+  notify-failure:
+    if: ${{ always() && (needs.promote.result == 'failure' || needs.post-promote-smoke.result == 'failure') }}
+    needs: [promote, post-promote-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Notify Slack on promote failure
+        uses: ./.github/actions/notify-slack-failure
+        with:
+          slack-webhook-url: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          workflow: ${{ github.workflow }}
+          repository: ${{ github.repository }}
+          sha: ${{ github.sha }}
+          ref-name: ${{ github.ref_name }}
+          actor: ${{ github.actor }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

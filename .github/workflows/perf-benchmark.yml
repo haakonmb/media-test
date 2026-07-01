@@ -1,0 +1,234 @@
+name: Perf Benchmark
+
+# STORMY-948 — per-request DB-efficiency benchmark + regression gate (NOT capacity).
+# Single app instance + local Postgres, low fixed concurrency. See perf/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      # Low fixed concurrency on purpose: this measures per-request DB efficiency, not capacity. On a
+      # shared single-box runner (app + Postgres + k6 share cores), high VUs just saturate CPU and turn
+      # every endpoint into multi-second noise — the first 40-VU validation run showed exactly that.
+      vus: { description: "k6 VUs", default: "10" }
+      duration: { description: "k6 duration", default: "180s" }
+  workflow_call:
+    inputs:
+      # Low fixed concurrency on purpose: this measures per-request DB efficiency, not capacity. On a
+      # shared single-box runner (app + Postgres + k6 share cores), high VUs just saturate CPU and turn
+      # every endpoint into multi-second noise — the first 40-VU validation run showed exactly that.
+      vus:
+        description: "k6 VUs"
+        required: false
+        default: "10"
+        type: string
+      duration:
+        description: "k6 duration"
+        required: false
+        default: "180s"
+        type: string
+      comment_on_pr:
+        required: true
+        type: boolean
+      update_baseline:
+        required: true
+        type: boolean
+
+# The PR comment + the main-branch baseline auto-commit need write scopes the default token lacks.
+permissions:
+  contents: write # baseline auto-commit/push on main
+  pull-requests: write # post the perf report as a PR comment
+
+# PR runs only when ci.yml sees the 'perf' label and relevant changed files; push/dispatch always run.
+jobs:
+  benchmark:
+    runs-on: self-hosted # stable CPU → less-noisy latency; pg_stat_statements is the primary (DB-side) gate
+    timeout-minutes: 25
+    env:
+      # libpq vars — node pg scripts (mint-tokens, collect-and-compare) + psql
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: stormy
+      PGPASSWORD: stormy
+      PGDATABASE: stormy
+      # pgInitPools(process.env) takes the password branch only when NODE_TEST_ENV is 'ci' (or
+      # NODE_ENV is localhost/dev); otherwise it builds an RDS IAM Signer and fails in CI. This is
+      # the single knob that selects password auth — PG_AUTH_MODE is then irrelevant (left unset).
+      NODE_TEST_ENV: ci
+      # app config — pools read these raw env vars (PG_USER/PG_PASSWORD/PG_HOST/PG_DATABASE/PG_PORT).
+      PG_HOST: localhost
+      PG_READ_HOST: localhost
+      PG_PORT: "5432"
+      PG_USER: stormy
+      PG_PASSWORD: stormy
+      PG_DATABASE: stormy
+      HTTP_PORT: "8080"
+      SERVER_URL: http://localhost:8080
+      AWS_REGION: us-east-1
+      # HOST_REGION is deliberately NOT set job-wide: it switches the app pool to SSL + IAM-signed
+      # auth, which the plain local Postgres can't speak. The app's CI pool branch (NODE_TEST_ENV=ci)
+      # ignores it, so it's set only on the app start step as insurance.
+      JWT_SECRET: perf-benchmark-secret # CI-only; mint-tokens + app share it
+      JWT_ACCESS_TOKEN_EXPIRATION: 15m
+      JWT_REFRESH_TOKEN_EXPIRATION: 7d
+      ADMIN_PASS: perf
+      # Dummy externals — config.ts requires them at boot, but the read-path benchmark
+      # never calls them (clients init lazily). Create/media/push journeys may 500 (expected).
+      AWS_S3_BUCKET: perf-bucket
+      AWS_S3_SIGNED_URL_EXPIRATION: "3600"
+      AWS_SES_SENDER: perf@perf.invalid
+      AWS_SQS_MEDIA_UPLOADS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/perf-media
+      AWS_SQS_MODERATION_JOB_RESULTS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/000000000000/perf-mod
+      AWS_CLOUDFRONT_MEDIA_URL: https://perf.invalid
+      AWS_CLOUDFRONT_MEDIA_KEYPAIR_ID: PERFDUMMYKEYPAIR
+      DYNAMO_CHAT_MEMBERS_TABLE: perf
+      DYNAMO_RYW_TABLE: perf
+      DYNAMO_STORY_METADATA_TABLE: perf
+      DYNAMO_USER_PRESENCE_TABLE: perf
+      DYNAMO_VERIFICATION_TABLE: perf
+      DYNAMO_RECOMMENDED_FOLLOWS_TABLE: perf
+      FIREBASE_PROJECT_ID: perf
+      FIREBASE_CLIENT_EMAIL: perf@perf.invalid
+      # AWS_CLOUDFRONT_MEDIA_PRIVATE_KEY + FIREBASE_PRIVATE_KEY are generated as a real RSA PEM
+      # in the "Generate throwaway boot keys" step (a dummy string would crash an eager key-parse).
+      PERF_BASE_URL: http://localhost:8080
+      PERF_TOKENS: perf/tokens.json
+      PERF_SUMMARY_OUT: perf/k6-summary.json
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with: { node-version: "26", cache: "npm" } # match the repo (backend-checks.yml pins 26); no .nvmrc exists
+      - run: npm ci
+
+      # config.ts requireEnv()s these two keys at *import* time, so every step that loads config
+      # (migrate, seed, app start) needs them. A dummy string crashes any eager key-parse, so hand
+      # over one real throwaway RSA PEM via $GITHUB_ENV (multi-line heredoc form) for all later steps.
+      - name: Generate throwaway boot keys
+        run: |
+          KEY="$(openssl genrsa 2048 2>/dev/null)"
+          # Mask every line so the throwaway PEM never appears in logs.
+          while IFS= read -r line; do [ -n "$line" ] && echo "::add-mask::$line"; done <<< "$KEY"
+          for v in AWS_CLOUDFRONT_MEDIA_PRIVATE_KEY FIREBASE_PRIVATE_KEY; do
+            { echo "$v<<PEM_EOF"; echo "$KEY"; echo "PEM_EOF"; } >> "$GITHUB_ENV"
+          done
+
+      # pgvector image (= official postgres:18 + the `vector` extension, with pg_trgm + pg_stat_statements
+      # still bundled) so the migration chain's CREATE EXTENSION calls resolve. pg_cron is deliberately
+      # NOT installed (it needs a preloaded library that crashes a one-shot CI container, and its only
+      # use — message-partition cron — is irrelevant to a read-path benchmark); the migration that needs
+      # it is skipped below. A GHA `services:` block can't preload libraries, hence docker run.
+      - name: Start Postgres
+        run: |
+          docker run -d --name perfpg -p 5432:5432 \
+            -e POSTGRES_USER=$PGUSER -e POSTGRES_PASSWORD=$PGPASSWORD -e POSTGRES_DB=$PGDATABASE \
+            pgvector/pgvector:pg18 -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.track=all -c pg_stat_statements.max=10000
+          for i in $(seq 1 30); do docker exec perfpg pg_isready -U $PGUSER && break; sleep 2; done
+
+      - name: Prepare schema prerequisites (roles, extensions)
+        run: |
+          P() { docker exec -e PGPASSWORD=$PGPASSWORD perfpg psql -U $PGUSER -d $PGDATABASE -v ON_ERROR_STOP=1 -c "$1"; }
+          # Roles the migrations GRANT to / set default privileges for, but never create (superuser is `stormy`).
+          P "DO \$\$ BEGIN
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='postgres') THEN CREATE ROLE postgres SUPERUSER LOGIN; END IF;
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='stormy_explore') THEN CREATE ROLE stormy_explore; END IF;
+             END \$\$;"
+          P "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+          # The pg_cron migration (00048) self-guards on shared_preload_libraries via a DO/EXCEPTION
+          # block, so it no-ops cleanly in this ephemeral container without pg_cron preloaded.
+
+      - name: Install goose
+        run: |
+          GOOSE_VERSION=3.27.1
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o "$HOME/.local/bin/goose" \
+            "https://github.com/pressly/goose/releases/download/v${GOOSE_VERSION}/goose_linux_x86_64"
+          chmod +x "$HOME/.local/bin/goose"
+          "$HOME/.local/bin/goose" -version
+
+      - name: Migrate
+        run: npm run migrate:up
+
+      # Seeds are committed as .ts importing src/*.ts (tsc doesn't emit them, rootDir=src) and use an
+      # async IIFE (no top-level await), so tsx runs them directly. story-seed does slow per-row inserts
+      # (it warns above 500 stories), so the size is kept in its comfort zone: 500 users / 500 stories.
+      # That's plenty to exercise the feed CTE plan once the follow graph is wired below — the per-request
+      # DB-call count and query plan are stable regardless of volume. story-seed creates the users it needs.
+      - name: Seed (fixed perf dataset)
+        run: npx tsx db/seeds/story-seed.ts 500 500
+
+      # The seeds build users + stories but no follow graph, so list-followed (the feed CTE — the
+      # benchmark's headline query) would return empty. Wire each user to ~30 others so the CTE joins
+      # are exercised. Fresh DB → distinct (followerId, followedId) pairs, so no ON CONFLICT needed.
+      - name: Seed follow graph
+        run: |
+          docker exec -e PGPASSWORD=$PGPASSWORD perfpg psql -U $PGUSER -d $PGDATABASE -c \
+            "INSERT INTO \"following\" (\"followerId\", \"followedId\")
+             SELECT u1.id, u2.id FROM \"user\" u1
+             CROSS JOIN LATERAL (
+               SELECT id FROM \"user\" WHERE id <> u1.id ORDER BY random() LIMIT 30
+             ) u2;"
+          docker exec -e PGPASSWORD=$PGPASSWORD perfpg psql -U $PGUSER -d $PGDATABASE -c \
+            "SELECT count(*) AS follow_edges FROM \"following\";"
+
+      # build = tsc → dist; start = node dist/main.js (the production path, plain node is correct here).
+      # Region vars are set here (not job-wide) so boot code that reads them is happy. The CI pool
+      # branch (NODE_TEST_ENV=ci) has no ssl field, so plain local Postgres stays reachable.
+      - name: Build + start app
+        env:
+          HOST_REGION: us-east-1
+          PRIMARY_REGION: us-east-1
+        run: |
+          npm run build
+          (npm run start &) ; echo "waiting for app..."
+          for i in $(seq 1 45); do curl -sf $PERF_BASE_URL/api/readyz && break; sleep 2; done
+          curl -sf $PERF_BASE_URL/api/readyz || { echo "::error::app did not become ready on /api/readyz"; exit 1; }
+
+      - name: Mint JWT corpus for seeded users
+        run: node perf/mint-tokens.mjs --count 500 --out $PERF_TOKENS
+
+      - name: Reset query stats, then run benchmark
+        run: |
+          docker exec -e PGPASSWORD=$PGPASSWORD perfpg psql -U $PGUSER -d $PGDATABASE -c "SELECT pg_stat_statements_reset();"
+          # Run k6 via its image (no runner-side k6 dependency). --network host reaches the app on
+          # localhost; absolute /work paths sidestep k6 open()'s script-relative resolution. Run as the
+          # runner's UID so k6's handleSummary can write k6-summary.json into the bind-mounted perf/ dir
+          # (the image's default `k6` user can't write to runner-owned files → "permission denied").
+          docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work \
+            -e PERF_BASE_URL=$PERF_BASE_URL \
+            -e PERF_TOKENS=/work/perf/tokens.json \
+            -e PERF_SUMMARY_OUT=/work/perf/k6-summary.json \
+            -e PERF_VUS=${{ inputs.vus || '10' }} -e PERF_DURATION=${{ inputs.duration || '180s' }} \
+            grafana/k6 run perf/scenario.js
+
+      - name: Compare to baseline (gate)
+        run: node perf/collect-and-compare.mjs --k6 $PERF_SUMMARY_OUT --baseline perf/baseline.json --out perf-report.md
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          { name: perf-report, path: "perf-report.md\nperf/k6-summary.json" }
+
+      - name: Comment on PR
+        if: always() && inputs.comment_on_pr
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('perf-report.md', 'utf8');
+            await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+
+      # On main, refresh the committed baseline from this run (the trend) and commit it.
+      - name: Update baseline (main only)
+        if: inputs.update_baseline
+        run: |
+          node perf/collect-and-compare.mjs --k6 $PERF_SUMMARY_OUT --baseline perf/baseline.json --update-baseline
+          if ! git diff --quiet perf/baseline.json; then
+            git config user.name "github-actions[bot]"; git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add perf/baseline.json && git commit -m "perf: refresh benchmark baseline [skip ci]" && git push
+          fi
+
+      - name: Teardown Postgres
+        if: always()
+        run: docker rm -f perfpg || true

@@ -1,0 +1,54 @@
+name: Notify Slack Failure
+description: Send a standard Slack notification for a failed GitHub Actions workflow.
+
+inputs:
+  slack-webhook-url:
+    description: Slack incoming webhook URL.
+    required: true
+  workflow:
+    description: Workflow display name.
+    required: true
+  repository:
+    description: Repository in owner/name form.
+    required: true
+  sha:
+    description: Commit SHA for the failed run.
+    required: true
+  ref-name:
+    description: Ref name for the failed run.
+    required: true
+  actor:
+    description: Actor that triggered the run.
+    required: true
+  run-url:
+    description: URL to the failed workflow run.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Notify Slack
+      shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.slack-webhook-url }}
+        WORKFLOW: ${{ inputs.workflow }}
+        REPOSITORY: ${{ inputs.repository }}
+        SHA: ${{ inputs.sha }}
+        REF_NAME: ${{ inputs.ref-name }}
+        ACTOR: ${{ inputs.actor }}
+        RUN_URL: ${{ inputs.run-url }}
+      run: |
+        set -euo pipefail
+        if [ -z "${SLACK_WEBHOOK_URL}" ]; then
+          echo "::warning::SLACK_DEPLOY_WEBHOOK_URL is not set; skipping notification."
+          exit 0
+        fi
+        jq -n \
+          --arg workflow "${WORKFLOW}" \
+          --arg repo "${REPOSITORY}" \
+          --arg sha "${SHA}" \
+          --arg ref "${REF_NAME}" \
+          --arg actor "${ACTOR}" \
+          --arg url "${RUN_URL}" \
+          '{text: ":rotating_light: *\($workflow)* failed on `\($repo)@\($sha[0:7])` (ref `\($ref)`, triggered by \($actor)). <\($url)|View run>"}' \
+          | curl -fsS -X POST -H 'Content-Type: application/json' --data @- "${SLACK_WEBHOOK_URL}"

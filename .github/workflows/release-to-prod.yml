@@ -1,0 +1,414 @@
+name: Release stormy-backend to prod
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v1.2.3 or v1.2.3-rc.1)'
+        required: true
+        type: string
+      ref:
+        description: 'Override source: full/short git SHA OR pseudo-semver tag (v0.0.0-dev.<n>-<short>). Default: whatever is currently deployed on test.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: stormy-backend-release-prod
+  cancel-in-progress: false
+
+env:
+  ECR_REGISTRY: 631946745248.dkr.ecr.eu-central-1.amazonaws.com
+  ECR_REGISTRY_ID: "631946745248"
+  ECR_REPO: stormy-backend
+  AWS_REGION: eu-central-1
+  DEPLOYMENT_REPO: Stormy-AS/stormy_deployment_argocd
+  DEPLOYMENT_BRANCH: master
+  SOURCE_REPO: Stormy-AS/stormy_backend
+  TEST_OVERLAY_PATH: stormy-app/.argocd-source-stormy-backend-test-eu-central-1.yaml
+  PROD_REGIONS: "eu-central-1 us-east-1 ap-southeast-1"
+  RELEASE_LABEL: release-prod-stormy-backend
+
+jobs:
+  release-to-prod:
+    runs-on: self-hosted
+    env:
+      GH_VERSION: "2.65.0"
+    steps:
+      - name: Ensure gh CLI is available
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if "$HOME/.local/bin/gh" --version 2>/dev/null | grep -q "${GH_VERSION}"; then
+            echo "gh ${GH_VERSION} already installed."
+          else
+            echo "Installing gh ${GH_VERSION}..."
+            rm -rf /tmp/gh-install && mkdir -p /tmp/gh-install
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
+              | tar -xz -C /tmp/gh-install --strip-components=1
+            mv /tmp/gh-install/bin/gh "$HOME/.local/bin/gh"
+            rm -rf /tmp/gh-install
+          fi
+          "$HOME/.local/bin/gh" --version
+
+      - name: Mint GH App token (scoped to deployment repo)
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          repositories: stormy_deployment_argocd
+
+      - name: Checkout deployment repo
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.DEPLOYMENT_REPO }}
+          ref: ${{ env.DEPLOYMENT_BRANCH }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: _deploy
+
+      - name: Validate version and resolve source SHA
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          # Allow v<semver> with optional pre-release / build suffix: v1.2.3, v1.2.3-rc.1, v1.2.3-test, v1.2.3+build42.
+          if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: Version '${VERSION}' is not in 'v<semver>' format."
+            exit 1
+          fi
+
+          # Fail loudly if the version already exists as a tag or release.
+          # This prevents accidental double-tagging and forces explicit cleanup
+          # on partial-failure recovery.
+          if gh api "repos/${SOURCE_REPO}/git/refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "ERROR: Tag '${VERSION}' already exists in ${SOURCE_REPO}."
+            echo "If you need to re-release, delete it first: gh release delete ${VERSION} --cleanup-tag --repo ${SOURCE_REPO}"
+            exit 1
+          fi
+          if gh release view "${VERSION}" --repo "${SOURCE_REPO}" >/dev/null 2>&1; then
+            echo "ERROR: Release '${VERSION}' already exists in ${SOURCE_REPO}."
+            echo "If you need to re-release, delete it first: gh release delete ${VERSION} --cleanup-tag --repo ${SOURCE_REPO}"
+            exit 1
+          fi
+
+          # Resolve source ref. Accepts SHA, pseudo-semver tag, or (default)
+          # whatever the test overlay currently pins.
+          PSEUDO_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?-dev\.[0-9]+-[0-9a-f]+$'
+
+          if [ -z "${INPUT_REF}" ]; then
+            echo "No ref provided; reading test overlay from cloned deployment repo."
+            TAG=$(grep -A1 'name: image\.tag' "_deploy/${TEST_OVERLAY_PATH}" \
+              | tail -1 \
+              | sed -E 's/^[[:space:]]*value:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/')
+            if [[ ! "${TAG}" =~ ${PSEUDO_RE} ]]; then
+              echo "ERROR: test overlay image.tag must be a pseudo-semver tag (v<base>-dev.<n>-<short>), got: ${TAG}"
+              exit 1
+            fi
+            SHORT_SHA_FROM_TAG="${TAG##*-}"
+            FULL_SHA=$(gh api "repos/${SOURCE_REPO}/commits/${SHORT_SHA_FROM_TAG}" --jq .sha)
+          elif [[ "${INPUT_REF}" =~ ${PSEUDO_RE} ]]; then
+            echo "Using user-provided pseudo-semver tag: ${INPUT_REF}"
+            SHORT_SHA_FROM_TAG="${INPUT_REF##*-}"
+            FULL_SHA=$(gh api "repos/${SOURCE_REPO}/commits/${SHORT_SHA_FROM_TAG}" --jq .sha)
+          else
+            echo "Using user-provided SHA: ${INPUT_REF}"
+            FULL_SHA=$(gh api "repos/${SOURCE_REPO}/commits/${INPUT_REF}" --jq .sha)
+          fi
+
+          SHORT_SHA="${FULL_SHA:0:7}"
+          echo "Version:    ${VERSION}"
+          echo "Full SHA:   ${FULL_SHA}"
+          echo "Short SHA:  ${SHORT_SHA}"
+          {
+            echo "version=${VERSION}"
+            echo "full_sha=${FULL_SHA}"
+            echo "short_sha=${SHORT_SHA}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Capture source image digest and re-tag in ECR
+        id: ecr
+        env:
+          FULL_SHA: ${{ steps.release.outputs.full_sha }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # --registry-id is required because the runner's IAM identity is in
+          # a different AWS account than ECR (cross-account: runner role in dev,
+          # ECR in shared). Without it, the AWS CLI queries the runner's account,
+          # which does not host this repository. The runner role is granted
+          # describe/batch-get/put on this repo via the ECR repository policy.
+
+          # Capture the source image manifest digest. Also serves as the
+          # existence check: aws ecr describe-images fails if the image is missing.
+          DIGEST=$(aws ecr describe-images \
+            --registry-id "${ECR_REGISTRY_ID}" \
+            --repository-name "${ECR_REPO}" \
+            --region "${AWS_REGION}" \
+            --image-ids "imageTag=sha-${FULL_SHA}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: ECR has no image at sha-${FULL_SHA}; describe-images returned: ${DIGEST}"
+            exit 1
+          fi
+          echo "Source image digest: ${DIGEST}"
+
+          # Read the source manifest, then put it under ${VERSION}. This creates
+          # a true tag alias — ECR shows ${VERSION} and sha-${FULL_SHA} resolving
+          # to the same digest. No layer transfer. Idempotent on re-run.
+          IMAGE_JSON=$(aws ecr batch-get-image \
+            --registry-id "${ECR_REGISTRY_ID}" \
+            --repository-name "${ECR_REPO}" \
+            --region "${AWS_REGION}" \
+            --image-ids "imageTag=sha-${FULL_SHA}" \
+            --output json)
+          MANIFEST=$(echo "${IMAGE_JSON}" | jq -r '.images[0].imageManifest')
+          MEDIA_TYPE=$(echo "${IMAGE_JSON}" | jq -r '.images[0].imageManifestMediaType')
+
+          aws ecr put-image \
+            --registry-id "${ECR_REGISTRY_ID}" \
+            --repository-name "${ECR_REPO}" \
+            --region "${AWS_REGION}" \
+            --image-tag "${VERSION}" \
+            --image-manifest "${MANIFEST}" \
+            --image-manifest-media-type "${MEDIA_TYPE}" \
+            > /dev/null
+          echo "Re-tagged sha-${FULL_SHA} as ${VERSION} (same digest: ${DIGEST})"
+
+          # Retention marker: the ECR lifecycle policy keeps release-* forever, so
+          # this digest is never pruned even though it also carries ephemeral
+          # sha-/commit-/-dev tags from the build it was promoted from.
+          aws ecr put-image \
+            --registry-id "${ECR_REGISTRY_ID}" \
+            --repository-name "${ECR_REPO}" \
+            --region "${AWS_REGION}" \
+            --image-tag "release-${VERSION}" \
+            --image-manifest "${MANIFEST}" \
+            --image-manifest-media-type "${MEDIA_TYPE}" \
+            > /dev/null
+          echo "Tagged release-${VERSION} (lifecycle retention marker)"
+
+          echo "digest=${DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create git tag and GitHub Release
+        id: gh_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          FULL_SHA: ${{ steps.release.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+
+          # Auto-mark pre-release if version has a semver pre-release segment (e.g. v1.2.3-rc.1).
+          if [[ "${VERSION}" == *-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          else
+            PRERELEASE_FLAG=""
+          fi
+
+          # Create lightweight git tag at the source SHA via REST API.
+          gh api "repos/${SOURCE_REPO}/git/refs" \
+            -X POST \
+            -f "ref=refs/tags/${VERSION}" \
+            -f "sha=${FULL_SHA}" \
+            > /dev/null
+
+          # Create the GitHub Release with auto-generated notes (commits since
+          # the previous release).
+          gh release create "${VERSION}" \
+            --repo "${SOURCE_REPO}" \
+            --target "${FULL_SHA}" \
+            --title "${VERSION}" \
+            --generate-notes \
+            ${PRERELEASE_FLAG} \
+            > /dev/null
+
+          RELEASE_URL="https://github.com/${SOURCE_REPO}/releases/tag/${VERSION}"
+          echo "Created git tag and GitHub Release: ${RELEASE_URL}"
+          echo "release_url=${RELEASE_URL}" >> "${GITHUB_OUTPUT}"
+
+      - name: Pre-flight (label, close prior PRs, clean dangling branches)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          RUN_ID: ${{ github.run_id }}
+        working-directory: _deploy
+        run: |
+          set -euo pipefail
+
+          gh label create "${RELEASE_LABEL}" \
+            --repo "${DEPLOYMENT_REPO}" \
+            --color D93F0B \
+            --description "Auto-managed: PR releases stormy-backend to prod" \
+            --force
+
+          for pr in $(gh pr list \
+            --repo "${DEPLOYMENT_REPO}" \
+            --state open \
+            --label "${RELEASE_LABEL}" \
+            --json number --jq '.[].number'); do
+            echo "Closing prior release PR #${pr}"
+            gh pr close "${pr}" \
+              --repo "${DEPLOYMENT_REPO}" \
+              --delete-branch \
+              --comment "Superseded by release ${VERSION} (workflow run ${RUN_ID})."
+          done
+
+          git fetch origin --prune
+
+          active_heads=$(gh pr list \
+            --repo "${DEPLOYMENT_REPO}" \
+            --state open \
+            --label "${RELEASE_LABEL}" \
+            --json headRefName --jq '.[].headRefName')
+          for ref in $(git ls-remote --heads origin "release-prod-stormy-backend-*" \
+            | awk '{print $2}' | sed 's|refs/heads/||'); do
+            if ! grep -qx "${ref}" <<< "${active_heads}"; then
+              echo "Deleting dangling branch: ${ref}"
+              git push origin --delete "${ref}" || true
+            fi
+          done
+
+      - name: Release (rewrite overlays, push, open PR)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          SOURCE_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          FULL_SHA: ${{ steps.release.outputs.full_sha }}
+          SHORT_SHA: ${{ steps.release.outputs.short_sha }}
+          DIGEST: ${{ steps.ecr.outputs.digest }}
+          RELEASE_URL: ${{ steps.gh_release.outputs.release_url }}
+          RUN_ID: ${{ github.run_id }}
+        working-directory: _deploy
+        run: |
+          set -euo pipefail
+
+          # Sanitize version for branch name (replace anything outside [A-Za-z0-9.-] with '-').
+          VERSION_SLUG=$(echo "${VERSION}" | tr -c 'A-Za-z0-9.-' '-')
+          BRANCH="release-prod-stormy-backend-${VERSION_SLUG}-${RUN_ID}"
+          git checkout -b "${BRANCH}"
+
+          # Prod overlay format: tag + digest pin. Tag for human readability,
+          # digest for cryptographic immutability against tag reassignment.
+          OVERLAY_TAG_VALUE="${VERSION}@${DIGEST}"
+
+          TEMPLATE=$(cat <<EOF
+          helm:
+            parameters:
+            - name: image.repository
+              value: ${ECR_REGISTRY}/${ECR_REPO}
+              forcestring: true
+            - name: image.tag
+              value: ${OVERLAY_TAG_VALUE}
+              forcestring: true
+          EOF
+          )
+
+          for region in ${PROD_REGIONS}; do
+            echo "${TEMPLATE}" > "stormy-app/.argocd-source-stormy-backend-prod-${region}.yaml"
+          done
+
+          git config user.name "stormy-backend-ci"
+          git config user.email "stormy-backend-ci@stormyapp.io"
+          git add stormy-app/.argocd-source-stormy-backend-prod-*.yaml
+
+          if git diff --staged --quiet; then
+            echo "All prod overlays already pinned to ${OVERLAY_TAG_VALUE}; nothing to release."
+            exit 0
+          fi
+
+          git commit -m "release: stormy-backend to prod (${VERSION})"
+          git push -u origin "${BRANCH}"
+
+          COMMIT_SUBJECT=$(GH_TOKEN="${SOURCE_TOKEN}" gh api \
+            "repos/${SOURCE_REPO}/commits/${FULL_SHA}" \
+            --jq '.commit.message' | head -1)
+
+          DEV_DEPLOY_RUN_URL=$(GH_TOKEN="${SOURCE_TOKEN}" gh run list \
+            --repo "${SOURCE_REPO}" \
+            --workflow deploy-to-dev.yml \
+            --commit "${FULL_SHA}" \
+            --limit 1 \
+            --json url --jq '.[0].url // ""')
+
+          RELEASE_RUN_URL="https://github.com/${SOURCE_REPO}/actions/runs/${RUN_ID}"
+
+          PRERELEASE_NOTE=""
+          if [[ "${VERSION}" == *-* ]]; then
+            PRERELEASE_NOTE=$'\n**Note:** this is a **pre-release** version. Merging deploys to prod just like any other release; close this PR if that is not intended.\n'
+          fi
+
+          cat > /tmp/pr-body.md <<PRBODY
+          ## Release stormy-backend to prod: \`${VERSION}\`
+          ${PRERELEASE_NOTE}
+          | | |
+          |---|---|
+          | Release       | [\`${VERSION}\`](${RELEASE_URL}) |
+          | Source commit | [\`${SHORT_SHA}\`](https://github.com/${SOURCE_REPO}/commit/${FULL_SHA}) — ${COMMIT_SUBJECT} |
+          | Image digest  | \`${DIGEST}\` |
+          | Dev deploy run | ${DEV_DEPLOY_RUN_URL:-(not found)} |
+          | Release run   | ${RELEASE_RUN_URL} |
+
+          ## Diff
+
+          Same change in all three prod region overlay files (\`stormy-app/.argocd-source-stormy-backend-prod-{eu-central-1,us-east-1,ap-southeast-1}.yaml\`):
+
+          \`\`\`diff
+           helm:
+             parameters:
+             - name: image.tag
+          -    value: "<old>"
+          +    value: "${OVERLAY_TAG_VALUE}"
+               forcestring: true
+          \`\`\`
+
+          The \`<tag>@sha256:<digest>\` format pins prod to a specific image manifest. Even if the \`${VERSION}\` tag is ever re-pointed in ECR, ArgoCD will still pull this exact digest.
+
+          ## ECR
+
+          The release tag \`${VERSION}\` was added to the existing image digest (already in ECR as \`sha-${FULL_SHA}\`). No rebuild — this is a manifest copy.
+
+          ## Behavior on merge
+
+          Prod hub auto-syncs. Within ~3 minutes of merge, all three prod regions reconcile and roll stormy-backend to the digest pinned above. No manual \`argocd app sync\` needed.
+
+          ## Rollback
+
+          Open a follow-up PR setting \`image.tag\` back to the previous \`v<semver>@sha256:<digest>\` value. Same review surface, same audit trail.
+          PRBODY
+
+          gh pr create \
+            --repo "${DEPLOYMENT_REPO}" \
+            --base "${DEPLOYMENT_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Release stormy-backend to prod: ${VERSION}" \
+            --label "${RELEASE_LABEL}" \
+            --body-file /tmp/pr-body.md
+
+  notify-failure:
+    if: ${{ failure() }}
+    needs: [release-to-prod]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Notify Slack on release failure
+        uses: ./.github/actions/notify-slack-failure
+        with:
+          slack-webhook-url: ${{ secrets.SLACK_DEPLOY_WEBHOOK_URL }}
+          workflow: ${{ github.workflow }}
+          repository: ${{ github.repository }}
+          sha: ${{ github.sha }}
+          ref-name: ${{ github.ref_name }}
+          actor: ${{ github.actor }}
+          run-url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
